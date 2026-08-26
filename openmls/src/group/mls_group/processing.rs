@@ -475,28 +475,18 @@ impl MlsGroup {
             .write_group_state(self.group_id(), &self.group_state)
             .map_err(MergeCommitError::StorageError)?;
 
-        // Update the per-epoch emulation bindings. Self-removal drops them.
-        // Otherwise the epoch the commit moves the group into is bound to
-        // the derivation epoch of the commit's VC leaf, or, if the commit
-        // does not install a new VC leaf, to the binding of the current
-        // epoch, since the VC leaf stays active across commits by other
-        // members.
+        // Update the per-epoch emulation bindings. Self-removal drops them,
+        // along with the group's own derivation-epoch log. Otherwise the epoch
+        // the commit moves the group into is bound to the derivation epoch of
+        // the commit's VC leaf, or, if the commit does not install a new VC
+        // leaf, to the binding of the current epoch, since the VC leaf stays
+        // active across commits by other members. Either way the derivation
+        // epochs that lost their last reference are released.
         #[cfg(feature = "virtual-clients-draft")]
         if staged_commit.self_removed() {
-            provider
-                .storage()
-                .delete_vc_emulation_bindings(self.group_id())
+            self.drop_all_vc_derivation_epoch_references(provider.storage())
                 .map_err(|e| {
-                    log::error!("vc: drop emulation bindings on self-removal failed: {e:?}");
-                    MergeCommitError::StorageError(e)
-                })?;
-            provider
-                .storage()
-                .delete_registered_vc_derivation_epoch(self.group_id())
-                .map_err(|e| {
-                    log::error!(
-                        "vc: drop registered derivation epoch on self-removal failed: {e:?}"
-                    );
+                    log::error!("vc: drop derivation epoch references on self-removal: {e:?}");
                     MergeCommitError::StorageError(e)
                 })?;
         } else {
@@ -510,6 +500,7 @@ impl MlsGroup {
                 .clone()
                 .or_else(|| bindings.get(self.epoch()).cloned());
             if let Some(epoch_id) = epoch_id {
+                let previously_bound = bindings.bound_epoch_ids();
                 // Keep one entry per retained message-secrets epoch plus
                 // the new current one, so bindings age out in lockstep
                 // with the message secrets they are needed for.
@@ -521,6 +512,21 @@ impl MlsGroup {
                         log::error!("vc: persist emulation bindings at merge failed: {e:?}");
                         MergeCommitError::StorageError(e)
                     })?;
+                // The epochs whose bindings just aged out lost a reference, so
+                // offer their state for deletion.
+                let still_bound = bindings.bound_epoch_ids();
+                for released in previously_bound {
+                    if still_bound.contains(&released) {
+                        continue;
+                    }
+                    provider
+                        .storage()
+                        .delete_vc_derivation_epoch_state_if_unreferenced(&released)
+                        .map_err(|e| {
+                            log::error!("vc: release unbound derivation epoch at merge: {e:?}");
+                            MergeCommitError::StorageError(e)
+                        })?;
+                }
             }
         }
 

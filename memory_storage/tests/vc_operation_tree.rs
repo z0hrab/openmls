@@ -44,70 +44,81 @@ impl traits::VcEmulationBindings<CURRENT_VERSION> for TestEmulationBindings {}
 impl Entity<CURRENT_VERSION> for TestEmulationBindings {}
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
-struct TestRegistered(Vec<u8>);
-impl traits::RegisteredVcDerivationEpoch<CURRENT_VERSION> for TestRegistered {}
-impl Entity<CURRENT_VERSION> for TestRegistered {}
+struct TestEpochLog(Vec<u8>);
+impl traits::VcDerivationEpochLog<CURRENT_VERSION> for TestEpochLog {}
+impl Entity<CURRENT_VERSION> for TestEpochLog {}
 
-/// An emulation group's registration record keeps its epoch's state alive. A
-/// newer registration replaces the projection entry and releases the epoch,
-/// and so does deleting the record.
+/// Every epoch in an emulation group's derivation-epoch log keeps that epoch's
+/// state alive. A write replaces the projection, so an epoch pruned from the
+/// log is released, and so is every logged epoch when the log is deleted.
 #[test]
-fn registration_keeps_epoch_state_alive() {
+fn logged_epochs_keep_epoch_state_alive() {
     let storage = MemoryStorage::default();
-    let epoch_id = TestEpochId(b"RegisteredEpoch".to_vec());
+    let pruned_epoch_id = TestEpochId(b"PrunedEpoch".to_vec());
+    let newest_epoch_id = TestEpochId(b"NewestEpoch".to_vec());
     let group_id = TestGroupId(b"emulation-group".to_vec());
 
-    storage
-        .write_vc_derivation_epoch_state(&epoch_id, &TestDerivationState(b"state".to_vec()))
-        .unwrap();
-    assert!(!storage
-        .has_registered_vc_derivation_epoch_for_epoch(&epoch_id)
-        .unwrap());
+    for epoch_id in [&pruned_epoch_id, &newest_epoch_id] {
+        storage
+            .write_vc_derivation_epoch_state(epoch_id, &TestDerivationState(b"state".to_vec()))
+            .unwrap();
+        assert!(!storage
+            .has_logged_vc_derivation_epoch_for_epoch(epoch_id)
+            .unwrap());
+    }
 
+    let log = TestEpochLog(b"two entries".to_vec());
     storage
-        .write_registered_vc_derivation_epoch(
+        .write_vc_derivation_epoch_log(
             &group_id,
-            &TestRegistered(b"registration".to_vec()),
-            &epoch_id,
+            &log,
+            &[pruned_epoch_id.clone(), newest_epoch_id.clone()],
         )
         .unwrap();
-    assert!(storage
-        .has_registered_vc_derivation_epoch_for_epoch(&epoch_id)
-        .unwrap());
+    let read_log: Option<TestEpochLog> = storage.vc_derivation_epoch_log(&group_id).unwrap();
+    assert_eq!(read_log, Some(log));
 
-    // Nothing else references the epoch, so the registration alone has to
-    // keep the state.
-    assert!(!storage
-        .delete_vc_derivation_epoch_state_if_unreferenced(&epoch_id)
-        .unwrap());
-    let read_state: Option<TestDerivationState> =
-        storage.vc_derivation_epoch_state(&epoch_id).unwrap();
-    assert!(read_state.is_some());
+    // Nothing else references either epoch, so the log alone has to keep both
+    // states.
+    for epoch_id in [&pruned_epoch_id, &newest_epoch_id] {
+        assert!(storage
+            .has_logged_vc_derivation_epoch_for_epoch(epoch_id)
+            .unwrap());
+        assert!(!storage
+            .delete_vc_derivation_epoch_state_if_unreferenced(epoch_id)
+            .unwrap());
+        let read_state: Option<TestDerivationState> =
+            storage.vc_derivation_epoch_state(epoch_id).unwrap();
+        assert!(read_state.is_some());
+    }
 
-    // A newer registration supersedes the old epoch and releases it.
-    let newer_epoch_id = TestEpochId(b"NewerEpoch".to_vec());
+    // A shrunk log replaces the projection wholesale, which releases the epoch
+    // that dropped out of it.
     storage
-        .write_registered_vc_derivation_epoch(
+        .write_vc_derivation_epoch_log(
             &group_id,
-            &TestRegistered(b"newer registration".to_vec()),
-            &newer_epoch_id,
+            &TestEpochLog(b"one entry".to_vec()),
+            std::slice::from_ref(&newest_epoch_id),
         )
         .unwrap();
     assert!(!storage
-        .has_registered_vc_derivation_epoch_for_epoch(&epoch_id)
+        .has_logged_vc_derivation_epoch_for_epoch(&pruned_epoch_id)
         .unwrap());
     assert!(storage
-        .delete_vc_derivation_epoch_state_if_unreferenced(&epoch_id)
+        .delete_vc_derivation_epoch_state_if_unreferenced(&pruned_epoch_id)
         .unwrap());
     let read_state: Option<TestDerivationState> =
-        storage.vc_derivation_epoch_state(&epoch_id).unwrap();
+        storage.vc_derivation_epoch_state(&pruned_epoch_id).unwrap();
     assert!(read_state.is_none());
 
-    storage
-        .delete_registered_vc_derivation_epoch(&group_id)
-        .unwrap();
+    storage.delete_vc_derivation_epoch_log(&group_id).unwrap();
+    let read_log: Option<TestEpochLog> = storage.vc_derivation_epoch_log(&group_id).unwrap();
+    assert_eq!(read_log, None);
     assert!(!storage
-        .has_registered_vc_derivation_epoch_for_epoch(&newer_epoch_id)
+        .has_logged_vc_derivation_epoch_for_epoch(&newest_epoch_id)
+        .unwrap());
+    assert!(storage
+        .delete_vc_derivation_epoch_state_if_unreferenced(&newest_epoch_id)
         .unwrap());
 }
 

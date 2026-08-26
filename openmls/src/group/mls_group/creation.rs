@@ -662,6 +662,9 @@ impl StagedWelcome {
                 crate::components::vc_derivation_info::VcDerivationEpochParams::for_public_group(
                     &self.public_group,
                     self.own_leaf_index,
+                    self.mls_group_config
+                        .vc_derivation_epoch_retention_policy()
+                        .clone(),
                 ),
             )?;
         }
@@ -767,6 +770,7 @@ fn keys_for_welcome<Provider: OpenMlsProvider>(
         if let Some(material) =
             resolve_vc_welcome_material(provider, welcome.ciphersuite(), &hash_ref)?
         {
+            let consumed_epoch_id = material.epoch_id.clone();
             provider
                 .storage()
                 .delete_retained_key_package_material(&hash_ref)
@@ -776,6 +780,17 @@ fn keys_for_welcome<Provider: OpenMlsProvider>(
                     log::error!(
                         "vc: delete retained key package material in welcome failed: {e:?}"
                     );
+                    VirtualClientsError::StorageError
+                })?;
+            // Consuming the material dropped a reference to its derivation
+            // epoch, so we delete it if it's now unreferenced.
+            provider
+                .storage()
+                .delete_vc_derivation_epoch_state_if_unreferenced(&consumed_epoch_id)
+                .map_err(|e| {
+                    use crate::components::vc_derivation_info::VirtualClientsError;
+
+                    log::error!("vc: release derivation epoch after welcome failed: {e:?}");
                     VirtualClientsError::StorageError
                 })?;
             return Ok((

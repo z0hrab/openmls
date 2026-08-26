@@ -1,3 +1,6 @@
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::SystemTime;
+
 use openmls_traits::{
     crypto::OpenMlsCrypto,
     types::{Ciphersuite, CryptoError},
@@ -9,12 +12,17 @@ use tls_codec::{
     DeserializeBytes, SecretVLByteVec, Serialize as _, Size as _, TlsDeserializeBytes,
     TlsSerialize, TlsSize, VLByteSlice, VLByteVec,
 };
+#[cfg(target_arch = "wasm32")]
+use web_time::SystemTime;
 
 use crate::{
     binary_tree::{array_representation::TreeSize, LeafNodeIndex},
     ciphersuite::{hash_ref::KeyPackageRef, Secret},
     components::vc_operation_tree::OperationSecretTree,
-    group::{mls_group::errors::RegisterVcDerivationEpochError, GroupEpoch, GroupId},
+    group::{
+        mls_group::errors::RegisterVcDerivationEpochError, GroupEpoch, GroupId,
+        VcDerivationEpochRetentionPolicy,
+    },
     key_packages::InitKey,
     messages::PathSecret,
     schedule::application_export_tree::{ApplicationExportTree, ApplicationExportTreeError},
@@ -758,38 +766,123 @@ pub(crate) struct VcWelcomeMaterial {
     pub(crate) encryption_keypair: EncryptionKeyPair,
 }
 
-/// The newest derivation epoch of an emulation group, and the group epoch it
-/// was sourced from. All virtual-client operations of the group resolve to this
-/// derivation epoch, which may be older than the group's current epoch.
+/// One registration in an emulation group's [`VcDerivationEpochLog`].
 ///
 /// The group epoch is retained so that a repeated registration for the same
 /// group epoch returns the existing [`EpochId`] instead of consuming the
 /// forward-secure exporter again (the exporter is punctured by the first
-/// registration and cannot be re-evaluated).
+/// registration and cannot be re-evaluated). The timestamp is what the
+/// wall-clock deletion in [`MlsGroup::delete_vc_derivation_epochs`] compares
+/// against.
 ///
-/// Not folded into [`VcEmulationBindings`]: bindings are per higher-level group
-/// and are carried forward to the new epoch when a merged commit installs no
-/// virtual-client leaf, so they cannot say which derivation epoch is newest.
+/// [`MlsGroup::delete_vc_derivation_epochs`]: crate::group::MlsGroup::delete_vc_derivation_epochs
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct RegisteredVcDerivationEpoch {
+pub(crate) struct VcDerivationEpochLogEntry {
     /// The emulation group's own epoch at registration time.
     pub(crate) group_epoch: crate::group::GroupEpoch,
     /// The derivation epoch id derived by that registration.
     pub(crate) epoch_id: EpochId,
+    /// When the registration happened, in local wall-clock time.
+    pub(crate) registered_at: SystemTime,
+}
+
+/// Per-emulation-group log of the derivation epochs the group registered, in
+/// registration order with the newest at the back. The newest entry is the
+/// derivation epoch all new virtual-client operations of the group resolve to,
+/// which may be older than the group's current epoch.
+///
+/// [`VcDerivationEpochRetentionPolicy`]: crate::group::VcDerivationEpochRetentionPolicy
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct VcDerivationEpochLog {
+    // In registration order, oldest at the front.
+    entries: std::collections::VecDeque<VcDerivationEpochLogEntry>,
+}
+
+impl VcDerivationEpochLog {
+    /// The newest logged registration, or `None` if the log is empty.
+    pub(crate) fn newest(&self) -> Option<&VcDerivationEpochLogEntry> {
+        self.entries.back()
+    }
+
+    /// The derivation epochs this log names, without duplicates and in
+    /// registration order.
+    pub(crate) fn logged_epoch_ids(&self) -> Vec<EpochId> {
+        let mut epoch_ids = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            if !epoch_ids.contains(&entry.epoch_id) {
+                epoch_ids.push(entry.epoch_id.clone());
+            }
+        }
+        epoch_ids
+    }
+
+    /// Persist this log for `group_id`, together with the derivation epochs it
+    /// names. Storage keeps the state of a logged epoch alive, so the two have
+    /// to be written from the same log.
+    pub(crate) fn store<Storage: crate::storage::StorageProvider>(
+        &self,
+        storage: &Storage,
+        group_id: &GroupId,
+    ) -> Result<(), Storage::Error> {
+        storage.write_vc_derivation_epoch_log(group_id, self, &self.logged_epoch_ids())
+    }
+
+    /// Append a registration of `epoch_id` for `group_epoch`, timestamped now.
+    fn push(&mut self, group_epoch: GroupEpoch, epoch_id: EpochId) {
+        self.entries.push_back(VcDerivationEpochLogEntry {
+            group_epoch,
+            epoch_id,
+            registered_at: SystemTime::now(),
+        });
+    }
+
+    /// Drop the oldest entries until at most `max_entries` are left, and return
+    /// the epochs that are no longer logged. Never drops the newest entry, so
+    /// the group keeps a derivation epoch to operate on.
+    pub(crate) fn shrink_to(&mut self, max_entries: usize) -> Vec<EpochId> {
+        let excess = self.entries.len().saturating_sub(max_entries.max(1));
+        self.drop_oldest(excess)
+    }
+
+    /// Drop every entry registered before `cutoff` and return the epochs that
+    /// are no longer logged. Never drops the newest entry.
+    pub(crate) fn drop_registered_before(&mut self, cutoff: SystemTime) -> Vec<EpochId> {
+        let count = self
+            .entries
+            .iter()
+            .rposition(|entry| entry.registered_at < cutoff)
+            .map_or(0, |index| index + 1);
+        self.drop_oldest(count)
+    }
+
+    /// Drop the `count` oldest entries, keeping the newest one regardless, and
+    /// return the epochs no remaining entry still names.
+    fn drop_oldest(&mut self, count: usize) -> Vec<EpochId> {
+        let droppable = self.entries.len().saturating_sub(1);
+        let dropped: Vec<EpochId> = self
+            .entries
+            .drain(0..count.min(droppable))
+            .map(|entry| entry.epoch_id)
+            .collect();
+        let still_logged = self.logged_epoch_ids();
+        dropped
+            .into_iter()
+            .filter(|epoch_id| !still_logged.contains(epoch_id))
+            .collect()
+    }
 }
 
 /// The newest derivation epoch registered for the emulation group
 /// `emulation_group_id`, or `None` if none was registered yet.
 ///
-/// Reads the registration record, so the result reflects the emulation group's
+/// Reads the derivation-epoch log, so the result reflects the emulation group's
 /// state at the time of the call.
 pub(crate) fn newest_vc_derivation_epoch<Storage: crate::storage::StorageProvider>(
     storage: &Storage,
     emulation_group_id: &GroupId,
 ) -> Result<Option<EpochId>, Storage::Error> {
-    let registered: Option<RegisteredVcDerivationEpoch> =
-        storage.registered_vc_derivation_epoch(emulation_group_id)?;
-    Ok(registered.map(|registered| registered.epoch_id))
+    let log: Option<VcDerivationEpochLog> = storage.vc_derivation_epoch_log(emulation_group_id)?;
+    Ok(log.and_then(|log| log.newest().map(|entry| entry.epoch_id.clone())))
 }
 
 /// Resolve the derivation epoch a new virtual-client operation must use: the
@@ -830,17 +923,21 @@ pub(crate) struct VcDerivationEpochParams<'a> {
     pub(crate) own_leaf_index: LeafNodeIndex,
     /// Number of leaves in the emulation group's ratchet tree.
     pub(crate) tree_size: TreeSize,
+    /// How many derivation epochs the group's log may keep.
+    pub(crate) retention_policy: VcDerivationEpochRetentionPolicy,
 }
 
 impl<'a> VcDerivationEpochParams<'a> {
     /// Read the coordinates off the emulation group's public state. The caller
-    /// supplies `own_leaf_index`, which the public state does not carry.
+    /// supplies `own_leaf_index`, which the public state does not carry, and the
+    /// retention policy, which lives on the group's join config.
     ///
     /// For a merge, pass the state after the staged diff was merged, so the
     /// coordinates describe the epoch the commit moves the group into.
     pub(crate) fn for_public_group(
         public_group: &'a crate::group::PublicGroup,
         own_leaf_index: LeafNodeIndex,
+        retention_policy: VcDerivationEpochRetentionPolicy,
     ) -> Self {
         Self {
             group_id: public_group.group_id(),
@@ -848,6 +945,7 @@ impl<'a> VcDerivationEpochParams<'a> {
             group_epoch: public_group.group_context().epoch(),
             own_leaf_index,
             tree_size: public_group.tree_size(),
+            retention_policy,
         }
     }
 }
@@ -859,8 +957,12 @@ impl<'a> VcDerivationEpochParams<'a> {
 /// under [`VC_COMPONENT_ID`], derives the [`EpochId`], the AEAD key, the epoch
 /// base secret and the reuse-guard and generation-id secrets, builds the
 /// per-epoch operation secret tree (sized like the emulation group's ratchet
-/// tree), and persists the tree, the per-epoch state and the
-/// newest-derivation-epoch record. Returns the derived [`EpochId`].
+/// tree), and persists the tree, the per-epoch state and the appended
+/// derivation-epoch log. Returns the derived [`EpochId`].
+///
+/// Appending to the log applies the group's retention policy. The epochs that
+/// drop out of the window are released with a guarded delete, so their state
+/// survives if a higher-level group is still bound to them.
 ///
 /// The caller owns `export_tree` and is responsible for persisting it after
 /// this call, so that the puncture is not lost. A `None` export tree fails with
@@ -874,10 +976,10 @@ impl<'a> VcDerivationEpochParams<'a> {
 /// the persisted operation secret tree untouched. The repeat still punctures
 /// `export_tree` when it is handed a fresh, unpunctured tree for that epoch,
 /// as a retried Welcome join does. Without the puncture the caller would
-/// persist a tree that can re-derive the consumed secret. A record for the
-/// same group epoch whose [`EpochId`] does not match the tree belongs to a
-/// group instance that was never fully stored, for example a crashed group
-/// creation under a recycled group id, and is overwritten.
+/// persist a tree that can re-derive the consumed secret. A newest log entry
+/// for the same group epoch whose [`EpochId`] does not match the tree belongs to
+/// a group instance that was never fully stored, for example a crashed group
+/// creation under a recycled group id, and is appended past.
 pub(crate) fn register_vc_derivation_epoch<
     Crypto: OpenMlsCrypto,
     Storage: crate::storage::StorageProvider,
@@ -893,29 +995,31 @@ pub(crate) fn register_vc_derivation_epoch<
         group_epoch,
         own_leaf_index,
         tree_size,
+        retention_policy,
     } = params;
     let export_tree =
         export_tree.ok_or(RegisterVcDerivationEpochError::MissingApplicationExportTree)?;
 
-    let registered: Option<RegisteredVcDerivationEpoch> = storage
-        .registered_vc_derivation_epoch(group_id)
+    let mut log: VcDerivationEpochLog = storage
+        .vc_derivation_epoch_log(group_id)
         .map_err(|e| {
-            log::error!("vc: load newest derivation epoch before registration failed: {e:?}");
+            log::error!("vc: load derivation epoch log before registration failed: {e:?}");
             RegisterVcDerivationEpochError::Storage(e)
-        })?;
+        })?
+        .unwrap_or_default();
 
-    // Puncture before consulting the record. A repeat for a registered epoch
-    // can hold a fresh, unpunctured tree, and returning early on the record
-    // alone would let the caller persist that tree with the consumed secret
-    // still derivable.
+    // Puncture before consulting the log. A repeat for a registered epoch can
+    // hold a fresh, unpunctured tree, and returning early on the log alone
+    // would let the caller persist that tree with the consumed secret still
+    // derivable.
     let bytes = match export_tree.safe_export_secret(crypto, ciphersuite, VC_COMPONENT_ID) {
         Ok(bytes) => bytes,
         Err(ApplicationExportTreeError::PuncturedInput) => {
             // The tree in hand is already consumed, so this is an in-process
-            // repeat of a completed registration and the record must agree.
-            if let Some(registered) = &registered {
-                if registered.group_epoch == group_epoch {
-                    return Ok(registered.epoch_id.clone());
+            // repeat of a completed registration and the log must agree.
+            if let Some(newest) = log.newest() {
+                if newest.group_epoch == group_epoch {
+                    return Ok(newest.epoch_id.clone());
                 }
             }
             return Err(RegisterVcDerivationEpochError::ApplicationExportTree(
@@ -926,12 +1030,12 @@ pub(crate) fn register_vc_derivation_epoch<
     };
     let emulator_epoch_secret = EmulatorEpochSecret::new(bytes.as_slice());
     let epoch_id = emulator_epoch_secret.derive_epoch_id(crypto, ciphersuite)?;
-    if let Some(registered) = registered {
-        if registered.group_epoch == group_epoch && registered.epoch_id == epoch_id {
+    if let Some(newest) = log.newest() {
+        if newest.group_epoch == group_epoch && newest.epoch_id == epoch_id {
             // A retry with identical key material, for example a Welcome join
             // that crashed after registration. The per-epoch state is already
             // persisted, only the fresh tree needed puncturing.
-            return Ok(registered.epoch_id);
+            return Ok(newest.epoch_id.clone());
         }
     }
     let epoch_encryption_key =
@@ -950,31 +1054,37 @@ pub(crate) fn register_vc_derivation_epoch<
         tree_size,
         ciphersuite,
     );
-    let registered = RegisteredVcDerivationEpoch {
-        group_epoch,
-        epoch_id,
-    };
+    log.push(group_epoch, epoch_id.clone());
+    let dropped = log.shrink_to(retention_policy.max_epochs().unwrap_or(usize::MAX));
 
     storage
-        .write_vc_operation_tree(&registered.epoch_id, &operation_tree)
+        .write_vc_operation_tree(&epoch_id, &operation_tree)
         .map_err(|e| {
             log::error!("vc: persist operation tree at registration failed: {e:?}");
             RegisterVcDerivationEpochError::Storage(e)
         })?;
     storage
-        .write_vc_derivation_epoch_state(&registered.epoch_id, &state)
+        .write_vc_derivation_epoch_state(&epoch_id, &state)
         .map_err(|e| {
             log::error!("vc: persist derivation epoch state at registration failed: {e:?}");
             RegisterVcDerivationEpochError::Storage(e)
         })?;
-    storage
-        .write_registered_vc_derivation_epoch(group_id, &registered, &registered.epoch_id)
-        .map_err(|e| {
-            log::error!("vc: record newest derivation epoch at registration failed: {e:?}");
-            RegisterVcDerivationEpochError::Storage(e)
-        })?;
+    // The log is persisted before the dropped epochs are released, so the
+    // guarded delete sees the shrunk projection rather than the old one.
+    log.store(storage, group_id).map_err(|e| {
+        log::error!("vc: persist derivation epoch log at registration failed: {e:?}");
+        RegisterVcDerivationEpochError::Storage(e)
+    })?;
+    for dropped_epoch_id in dropped {
+        storage
+            .delete_vc_derivation_epoch_state_if_unreferenced(&dropped_epoch_id)
+            .map_err(|e| {
+                log::error!("vc: release pruned derivation epoch at registration failed: {e:?}");
+                RegisterVcDerivationEpochError::Storage(e)
+            })?;
+    }
 
-    Ok(registered.epoch_id)
+    Ok(epoch_id)
 }
 
 /// Per-higher-level-group record of which emulation-group epoch produced the

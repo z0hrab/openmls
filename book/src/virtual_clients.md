@@ -175,6 +175,44 @@ applies relative to the commit's input state: operations that reference a
 derivation epoch, including ones carried by this very commit, keep using the
 input state's newest derivation epoch.
 
+## Retaining derivation epochs
+
+An emulation group can be configured to keep a log of the derivation epochs it
+registered. This is such that emulator clients can still process delayed
+messages sent by sibling emulator clients.
+
+How far back the log reaches can be configure on group join, defaulting to five
+epochs:
+
+```rust,no_run,noplayground
+let create_config = MlsGroupCreateConfig::builder()
+    .emulation_group(true)
+    .set_vc_derivation_epoch_retention_policy(VcDerivationEpochRetentionPolicy::MaxEpochs(10))
+    // ... the leaf requirements above, ciphersuite, wire format policy
+    .build();
+```
+
+Registering a new derivation epoch drops the entries beyond the window that are
+not otherwise referenced, for example, by a higher-level group that relies on
+it. This liveness check runs wherever any references is dropped, so an epoch is
+released as soon as its last holder lets go.
+`MlsGroup::set_vc_derivation_epoch_retention_policy` changes the window later
+and applies it right away.
+
+`VcDerivationEpochRetentionPolicy::KeepAll` turns the automatic pruning off. The
+application then decides when epochs go, by age:
+
+```rust,no_run,noplayground
+let outcome = emulator_group.delete_vc_derivation_epochs(
+    provider,
+    VcDerivationEpochDeletion::older_than_duration(Duration::from_secs(24 * 3600)),
+)?;
+```
+
+The function returns the epochs whose state was deleted and the ones that were kept
+because something still referenced them. Either way they leave the log, so a
+later call does not reconsider them.
+
 ## Committing in a higher-level group
 
 To commit on behalf of the virtual client, set `vc_emulation` on the commit
@@ -465,8 +503,10 @@ The implementation tracks the draft but does not yet cover everything in it:
   `ProcessedMessage::vc_commit_data()`, and calls
   `process_vc_key_package_upload` itself. Only the `new_derivation_epoch` action
   is acted on by the library.
-- Per-epoch state for dead derivation epochs is not garbage collected
-  automatically.
+- Derivation epochs that predate the current retention policy are not
+  automatically deleted.
+- A retained KeyPackage that expires unused keeps its derivation epoch alive
+  until the application deletes the KeyPackage.
 
 Refer to the [virtual clients draft](https://github.com/mlswg/mls-virtual-clients)
 for the authoritative protocol description.

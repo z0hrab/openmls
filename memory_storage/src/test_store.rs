@@ -628,32 +628,32 @@ impl StorageProvider<V_TEST> for MemoryStorage {
     }
 
     #[cfg(feature = "virtual-clients-draft")]
-    fn write_registered_vc_derivation_epoch<
+    fn write_vc_derivation_epoch_log<
         GroupId: traits::GroupId<V_TEST>,
-        RegisteredVcDerivationEpoch: traits::RegisteredVcDerivationEpoch<V_TEST>,
+        VcDerivationEpochLog: traits::VcDerivationEpochLog<V_TEST>,
         EpochId: traits::VcEpochId<V_TEST>,
     >(
         &self,
         _group_id: &GroupId,
-        _registered: &RegisteredVcDerivationEpoch,
-        _epoch_id: &EpochId,
+        _log: &VcDerivationEpochLog,
+        _logged_epochs: &[EpochId],
     ) -> Result<(), Self::Error> {
         todo!()
     }
 
     #[cfg(feature = "virtual-clients-draft")]
-    fn registered_vc_derivation_epoch<
+    fn vc_derivation_epoch_log<
         GroupId: traits::GroupId<V_TEST>,
-        RegisteredVcDerivationEpoch: traits::RegisteredVcDerivationEpoch<V_TEST>,
+        VcDerivationEpochLog: traits::VcDerivationEpochLog<V_TEST>,
     >(
         &self,
         _group_id: &GroupId,
-    ) -> Result<Option<RegisteredVcDerivationEpoch>, Self::Error> {
+    ) -> Result<Option<VcDerivationEpochLog>, Self::Error> {
         todo!()
     }
 
     #[cfg(feature = "virtual-clients-draft")]
-    fn delete_registered_vc_derivation_epoch<GroupId: traits::GroupId<V_TEST>>(
+    fn delete_vc_derivation_epoch_log<GroupId: traits::GroupId<V_TEST>>(
         &self,
         _group_id: &GroupId,
     ) -> Result<(), Self::Error> {
@@ -726,7 +726,7 @@ impl StorageProvider<V_TEST> for MemoryStorage {
     }
 
     #[cfg(feature = "virtual-clients-draft")]
-    fn has_registered_vc_derivation_epoch_for_epoch<EpochId: traits::VcEpochId<V_TEST>>(
+    fn has_logged_vc_derivation_epoch_for_epoch<EpochId: traits::VcEpochId<V_TEST>>(
         &self,
         _epoch_id: &EpochId,
     ) -> Result<bool, Self::Error> {

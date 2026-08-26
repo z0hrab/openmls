@@ -198,14 +198,14 @@ impl<VcEpochId: VcEpochIdTrait<STORAGE_PROVIDER_VERSION>> StorableKeyRef<'_, VcE
         )
     }
 
-    pub(super) fn has_registered_vc_derivation_epoch_for_epoch<C: Codec>(
+    pub(super) fn has_logged_vc_derivation_epoch_for_epoch<C: Codec>(
         &self,
         connection: &rusqlite::Connection,
     ) -> Result<bool, rusqlite::Error> {
         self.epoch_reference_exists::<C>(
             connection,
             "SELECT EXISTS(
-                SELECT 1 FROM registered_vc_derivation_epochs
+                SELECT 1 FROM vc_derivation_epoch_log_epochs
                 WHERE epoch_id = ?1
                     AND provider_version = ?2
             )",
@@ -331,19 +331,20 @@ impl<GroupId: GroupIdTrait<STORAGE_PROVIDER_VERSION>> StorableKeyRef<'_, GroupId
     }
 }
 
-/// The derivation epoch an emulation group registered for its current group
-/// epoch. One row per emulation group, holding the serialized registration
-/// record plus the epoch id it names so the record can be queried by epoch.
-/// Written when a derivation epoch is registered.
-pub(super) struct StorableRegisteredVcDerivationEpochRef<
+/// The log of derivation epochs an emulation group registered. One row per
+/// emulation group, holding the serialized log, plus one row per logged
+/// derivation epoch in `vc_derivation_epoch_log_epochs` so the log can be
+/// queried by epoch. Written whenever a derivation epoch is registered or the
+/// log is pruned.
+pub(super) struct StorableVcDerivationEpochLogRef<
     'a,
-    RegisteredVcDerivationEpoch: EntityTrait<STORAGE_PROVIDER_VERSION>,
->(pub &'a RegisteredVcDerivationEpoch);
+    VcDerivationEpochLog: EntityTrait<STORAGE_PROVIDER_VERSION>,
+>(pub &'a VcDerivationEpochLog);
 
-impl<'a, RegisteredVcDerivationEpoch: EntityTrait<STORAGE_PROVIDER_VERSION>>
-    StorableRegisteredVcDerivationEpochRef<'a, RegisteredVcDerivationEpoch>
+impl<'a, VcDerivationEpochLog: EntityTrait<STORAGE_PROVIDER_VERSION>>
+    StorableVcDerivationEpochLogRef<'a, VcDerivationEpochLog>
 {
-    pub(super) fn store_registered_vc_derivation_epoch<
+    pub(super) fn store_vc_derivation_epoch_log<
         C: Codec,
         GroupId: GroupIdTrait<STORAGE_PROVIDER_VERSION>,
         EpochId: VcEpochIdTrait<STORAGE_PROVIDER_VERSION>,
@@ -351,39 +352,61 @@ impl<'a, RegisteredVcDerivationEpoch: EntityTrait<STORAGE_PROVIDER_VERSION>>
         &self,
         connection: &rusqlite::Connection,
         group_id: &GroupId,
-        epoch_id: &EpochId,
+        logged_epochs: &[EpochId],
     ) -> Result<(), rusqlite::Error> {
         connection.execute(
-            "INSERT INTO registered_vc_derivation_epochs
-                (provider_version, group_id, registration, epoch_id)
-            VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO vc_derivation_epoch_logs (provider_version, group_id, log)
+            VALUES (?1, ?2, ?3)
             ON CONFLICT(group_id) DO UPDATE SET
-                registration = excluded.registration,
-                epoch_id = excluded.epoch_id,
+                log = excluded.log,
                 provider_version = excluded.provider_version",
             params![
                 STORAGE_PROVIDER_VERSION,
                 KeyRefWrapper::<C, _>(group_id, PhantomData),
-                EntityRefWrapper::<C, _>(self.0, PhantomData),
-                KeyRefWrapper::<C, _>(epoch_id, PhantomData)
+                EntityRefWrapper::<C, _>(self.0, PhantomData)
             ],
         )?;
+        // The log above replaces the previous one wholesale, so the projection
+        // is rebuilt rather than added to. That also drops the epochs that were
+        // pruned from the log.
+        connection.execute(
+            "DELETE FROM vc_derivation_epoch_log_epochs
+            WHERE group_id = ?1
+                AND provider_version = ?2",
+            params![
+                KeyRefWrapper::<C, _>(group_id, PhantomData),
+                STORAGE_PROVIDER_VERSION
+            ],
+        )?;
+        let mut stmt = connection.prepare(
+            "INSERT INTO vc_derivation_epoch_log_epochs (provider_version, group_id, epoch_id)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(group_id, epoch_id) DO UPDATE SET
+                provider_version = excluded.provider_version",
+        )?;
+        for epoch_id in logged_epochs {
+            stmt.execute(params![
+                STORAGE_PROVIDER_VERSION,
+                KeyRefWrapper::<C, _>(group_id, PhantomData),
+                KeyRefWrapper::<C, _>(epoch_id, PhantomData)
+            ])?;
+        }
         Ok(())
     }
 }
 
 impl<GroupId: GroupIdTrait<STORAGE_PROVIDER_VERSION>> StorableKeyRef<'_, GroupId> {
-    pub(super) fn load_registered_vc_derivation_epoch<
+    pub(super) fn load_vc_derivation_epoch_log<
         C: Codec,
-        RegisteredVcDerivationEpoch: EntityTrait<STORAGE_PROVIDER_VERSION>,
+        VcDerivationEpochLog: EntityTrait<STORAGE_PROVIDER_VERSION>,
     >(
         &self,
         connection: &rusqlite::Connection,
-    ) -> Result<Option<RegisteredVcDerivationEpoch>, rusqlite::Error> {
+    ) -> Result<Option<VcDerivationEpochLog>, rusqlite::Error> {
         let Self(group_id) = self;
         let mut stmt = connection.prepare(
-            "SELECT registration
-            FROM registered_vc_derivation_epochs
+            "SELECT log
+            FROM vc_derivation_epoch_logs
             WHERE group_id = ?1
                 AND provider_version = ?2",
         )?;
@@ -393,21 +416,29 @@ impl<GroupId: GroupIdTrait<STORAGE_PROVIDER_VERSION>> StorableKeyRef<'_, GroupId
                 STORAGE_PROVIDER_VERSION
             ],
             |row| {
-                let EntityWrapper::<C, RegisteredVcDerivationEpoch>(registration, ..) =
-                    row.get(0)?;
-                Ok(registration)
+                let EntityWrapper::<C, VcDerivationEpochLog>(log, ..) = row.get(0)?;
+                Ok(log)
             },
         )
         .optional()
     }
 
-    pub(super) fn delete_registered_vc_derivation_epoch<C: Codec>(
+    pub(super) fn delete_vc_derivation_epoch_log<C: Codec>(
         &self,
         connection: &rusqlite::Connection,
     ) -> Result<(), rusqlite::Error> {
         let Self(group_id) = self;
         connection.execute(
-            "DELETE FROM registered_vc_derivation_epochs
+            "DELETE FROM vc_derivation_epoch_logs
+            WHERE group_id = ?1
+                AND provider_version = ?2",
+            params![
+                KeyRefWrapper::<C, GroupId>(group_id, PhantomData),
+                STORAGE_PROVIDER_VERSION
+            ],
+        )?;
+        connection.execute(
+            "DELETE FROM vc_derivation_epoch_log_epochs
             WHERE group_id = ?1
                 AND provider_version = ?2",
             params![

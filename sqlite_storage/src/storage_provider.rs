@@ -778,13 +778,13 @@ impl<C: Codec, ConnectionRef: Borrow<Connection>> StorageProvider<STORAGE_PROVID
     ) -> Result<bool, Self::Error> {
         // The application should call this within a transaction so the liveness
         // checks and the deletions apply atomically and a material, binding,
-        // or registration stored concurrently cannot be orphaned.
+        // or log entry stored concurrently cannot be orphaned.
         if StorableKeyRef(epoch_id)
             .has_retained_key_package_material_for_epoch::<C>(self.connection.borrow())?
             || StorableKeyRef(epoch_id)
                 .has_vc_emulation_binding_for_epoch::<C>(self.connection.borrow())?
             || StorableKeyRef(epoch_id)
-                .has_registered_vc_derivation_epoch_for_epoch::<C>(self.connection.borrow())?
+                .has_logged_vc_derivation_epoch_for_epoch::<C>(self.connection.borrow())?
         {
             return Ok(false);
         }
@@ -833,45 +833,42 @@ impl<C: Codec, ConnectionRef: Borrow<Connection>> StorageProvider<STORAGE_PROVID
     }
 
     #[cfg(feature = "virtual-clients-draft")]
-    fn write_registered_vc_derivation_epoch<
+    fn write_vc_derivation_epoch_log<
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        RegisteredVcDerivationEpoch: traits::RegisteredVcDerivationEpoch<STORAGE_PROVIDER_VERSION>,
+        VcDerivationEpochLog: traits::VcDerivationEpochLog<STORAGE_PROVIDER_VERSION>,
         EpochId: traits::VcEpochId<STORAGE_PROVIDER_VERSION>,
     >(
         &self,
         group_id: &GroupId,
-        registered: &RegisteredVcDerivationEpoch,
-        epoch_id: &EpochId,
+        log: &VcDerivationEpochLog,
+        logged_epochs: &[EpochId],
     ) -> Result<(), Self::Error> {
-        crate::vc_secrets::StorableRegisteredVcDerivationEpochRef(registered)
-            .store_registered_vc_derivation_epoch::<C, _, _>(
+        crate::vc_secrets::StorableVcDerivationEpochLogRef(log)
+            .store_vc_derivation_epoch_log::<C, _, _>(
                 self.connection.borrow(),
                 group_id,
-                epoch_id,
+                logged_epochs,
             )
     }
 
     #[cfg(feature = "virtual-clients-draft")]
-    fn registered_vc_derivation_epoch<
+    fn vc_derivation_epoch_log<
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        RegisteredVcDerivationEpoch: traits::RegisteredVcDerivationEpoch<STORAGE_PROVIDER_VERSION>,
+        VcDerivationEpochLog: traits::VcDerivationEpochLog<STORAGE_PROVIDER_VERSION>,
     >(
         &self,
         group_id: &GroupId,
-    ) -> Result<Option<RegisteredVcDerivationEpoch>, Self::Error> {
+    ) -> Result<Option<VcDerivationEpochLog>, Self::Error> {
         StorableKeyRef(group_id)
-            .load_registered_vc_derivation_epoch::<C, RegisteredVcDerivationEpoch>(
-                self.connection.borrow(),
-            )
+            .load_vc_derivation_epoch_log::<C, VcDerivationEpochLog>(self.connection.borrow())
     }
 
     #[cfg(feature = "virtual-clients-draft")]
-    fn delete_registered_vc_derivation_epoch<GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>>(
+    fn delete_vc_derivation_epoch_log<GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>>(
         &self,
         group_id: &GroupId,
     ) -> Result<(), Self::Error> {
-        StorableKeyRef(group_id)
-            .delete_registered_vc_derivation_epoch::<C>(self.connection.borrow())
+        StorableKeyRef(group_id).delete_vc_derivation_epoch_log::<C>(self.connection.borrow())
     }
 
     #[cfg(feature = "virtual-clients-draft")]
@@ -961,14 +958,14 @@ impl<C: Codec, ConnectionRef: Borrow<Connection>> StorageProvider<STORAGE_PROVID
     }
 
     #[cfg(feature = "virtual-clients-draft")]
-    fn has_registered_vc_derivation_epoch_for_epoch<
+    fn has_logged_vc_derivation_epoch_for_epoch<
         EpochId: traits::VcEpochId<STORAGE_PROVIDER_VERSION>,
     >(
         &self,
         epoch_id: &EpochId,
     ) -> Result<bool, Self::Error> {
         StorableKeyRef(epoch_id)
-            .has_registered_vc_derivation_epoch_for_epoch::<C>(self.connection.borrow())
+            .has_logged_vc_derivation_epoch_for_epoch::<C>(self.connection.borrow())
     }
 
     #[cfg(feature = "virtual-clients-draft")]

@@ -82,8 +82,8 @@ struct Data {
     vc_derivation_epoch_state: Table,
     vc_emulation_bindings: Table,
     vc_emulation_binding_epochs: Table,
-    registered_vc_derivation_epoch: Table,
-    registered_vc_derivation_epoch_id: Table,
+    vc_derivation_epoch_log: Table,
+    vc_derivation_epoch_log_epochs: Table,
     vc_operation_tree: Table,
     retained_key_package_material: Table,
     retained_key_package_epoch: Table,
@@ -1063,15 +1063,15 @@ macro_rules! impl_storage_provider_virtual_clients_draft {
         }
 
         #[cfg(feature = "virtual-clients-draft")]
-        fn registered_vc_derivation_epoch<
+        fn vc_derivation_epoch_log<
             GroupId: traits::GroupId<$version>,
-            RegisteredVcDerivationEpoch: traits::RegisteredVcDerivationEpoch<$version>,
+            VcDerivationEpochLog: traits::VcDerivationEpochLog<$version>,
         >(
             &self,
             group_id: &GroupId,
-        ) -> Result<Option<RegisteredVcDerivationEpoch>, $error> {
+        ) -> Result<Option<VcDerivationEpochLog>, $error> {
             let data = self.0 .0.lock().unwrap();
-            read(group_id, &data.registered_vc_derivation_epoch)
+            read(group_id, &data.vc_derivation_epoch_log)
         }
 
         #[cfg(feature = "virtual-clients-draft")]
@@ -1113,16 +1113,16 @@ macro_rules! impl_storage_provider_virtual_clients_draft {
             epoch_id: &EpochId,
         ) -> Result<bool, $error> {
             let data = self.0 .0.lock().unwrap();
-            epoch_has_emulation_binding(epoch_id, &data.vc_emulation_binding_epochs)
+            epoch_in_list(epoch_id, &data.vc_emulation_binding_epochs)
         }
 
         #[cfg(feature = "virtual-clients-draft")]
-        fn has_registered_vc_derivation_epoch_for_epoch<EpochId: traits::VcEpochId<$version>>(
+        fn has_logged_vc_derivation_epoch_for_epoch<EpochId: traits::VcEpochId<$version>>(
             &self,
             epoch_id: &EpochId,
         ) -> Result<bool, $error> {
             let data = self.0 .0.lock().unwrap();
-            epoch_is_referenced(epoch_id, &data.registered_vc_derivation_epoch_id)
+            epoch_in_list(epoch_id, &data.vc_derivation_epoch_log_epochs)
         }
 
         #[cfg(feature = "virtual-clients-draft")]
@@ -1155,30 +1155,26 @@ macro_rules! impl_storage_provider_virtual_clients_draft {
         ) -> Result<(), $error> {
             let mut data = self.0 .0.lock().unwrap();
             write(group_id, bindings, &mut data.vc_emulation_bindings)?;
-            write_bound_epochs(group_id, bound_epochs, &mut data.vc_emulation_binding_epochs)
+            write_epoch_list(group_id, bound_epochs, &mut data.vc_emulation_binding_epochs)
         }
 
         #[cfg(feature = "virtual-clients-draft")]
-        fn write_registered_vc_derivation_epoch<
+        fn write_vc_derivation_epoch_log<
             GroupId: traits::GroupId<$version>,
-            RegisteredVcDerivationEpoch: traits::RegisteredVcDerivationEpoch<$version>,
+            VcDerivationEpochLog: traits::VcDerivationEpochLog<$version>,
             EpochId: traits::VcEpochId<$version>,
         >(
             &self,
             group_id: &GroupId,
-            registered: &RegisteredVcDerivationEpoch,
-            epoch_id: &EpochId,
+            log: &VcDerivationEpochLog,
+            logged_epochs: &[EpochId],
         ) -> Result<(), $error> {
             let mut data = self.0 .0.lock().unwrap();
-            write(
+            write(group_id, log, &mut data.vc_derivation_epoch_log)?;
+            write_epoch_list(
                 group_id,
-                registered,
-                &mut data.registered_vc_derivation_epoch,
-            )?;
-            write_registered_epoch_id(
-                group_id,
-                epoch_id,
-                &mut data.registered_vc_derivation_epoch_id,
+                logged_epochs,
+                &mut data.vc_derivation_epoch_log_epochs,
             )
         }
 
@@ -1231,8 +1227,8 @@ macro_rules! impl_storage_provider_virtual_clients_draft {
         ) -> Result<bool, $error> {
             let mut data = self.0 .0.lock().unwrap();
             if epoch_is_referenced(epoch_id, &data.retained_key_package_epoch)?
-                || epoch_is_referenced(epoch_id, &data.registered_vc_derivation_epoch_id)?
-                || epoch_has_emulation_binding(epoch_id, &data.vc_emulation_binding_epochs)?
+                || epoch_in_list(epoch_id, &data.vc_derivation_epoch_log_epochs)?
+                || epoch_in_list(epoch_id, &data.vc_emulation_binding_epochs)?
             {
                 return Ok(false);
             }
@@ -1253,13 +1249,13 @@ macro_rules! impl_storage_provider_virtual_clients_draft {
         }
 
         #[cfg(feature = "virtual-clients-draft")]
-        fn delete_registered_vc_derivation_epoch<GroupId: traits::GroupId<$version>>(
+        fn delete_vc_derivation_epoch_log<GroupId: traits::GroupId<$version>>(
             &self,
             group_id: &GroupId,
         ) -> Result<(), $error> {
             let mut data = self.0 .0.lock().unwrap();
-            delete(group_id, &mut data.registered_vc_derivation_epoch)?;
-            delete(group_id, &mut data.registered_vc_derivation_epoch_id)
+            delete(group_id, &mut data.vc_derivation_epoch_log)?;
+            delete(group_id, &mut data.vc_derivation_epoch_log_epochs)
         }
 
         #[cfg(feature = "virtual-clients-draft")]
@@ -1509,48 +1505,35 @@ macro_rules! storage_helpers {
             Ok(references.values().any(|value| value == &serialized))
         }
 
-        /// Replaces the derivation epoch a group's registration record names.
-        /// The record is opaque, so this entry is what makes it queryable by
-        /// epoch.
+        /// Replaces the list of derivation epochs a group's record names. The
+        /// record itself is opaque, so the list is what makes it queryable by
+        /// epoch. Serves both the emulation bindings and the derivation-epoch
+        /// log.
         #[cfg(feature = "virtual-clients-draft")]
-        fn write_registered_epoch_id<GroupId: Key<$version>, EpochId: Key<$version>>(
+        fn write_epoch_list<GroupId: Key<$version>, EpochId: Key<$version>>(
             group_id: &GroupId,
-            epoch_id: &EpochId,
-            registered_epoch_ids: &mut Table,
+            epoch_ids: &[EpochId],
+            epoch_lists: &mut Table,
         ) -> Result<(), $err> {
-            let _ = registered_epoch_ids.insert($ser(group_id)?, $ser(epoch_id)?);
-
-            Ok(())
-        }
-
-        /// Replaces the list of derivation epochs a group's emulation bindings
-        /// bind. The binding record is opaque, so the list is what makes the
-        /// bindings queryable by epoch.
-        #[cfg(feature = "virtual-clients-draft")]
-        fn write_bound_epochs<GroupId: Key<$version>, EpochId: Key<$version>>(
-            group_id: &GroupId,
-            bound_epochs: &[EpochId],
-            bound_epoch_lists: &mut Table,
-        ) -> Result<(), $err> {
-            let mut serialized_epochs = Vec::with_capacity(bound_epochs.len());
-            for epoch_id in bound_epochs {
+            let mut serialized_epochs = Vec::with_capacity(epoch_ids.len());
+            for epoch_id in epoch_ids {
                 serialized_epochs.push($ser(epoch_id)?);
             }
-            let _ = bound_epoch_lists.insert($ser(group_id)?, $ser(&serialized_epochs)?);
+            let _ = epoch_lists.insert($ser(group_id)?, $ser(&serialized_epochs)?);
 
             Ok(())
         }
 
-        /// Whether the emulation bindings of any group still bind `epoch_id`.
+        /// Whether any group's epoch list in `epoch_lists` names `epoch_id`.
         #[cfg(feature = "virtual-clients-draft")]
-        fn epoch_has_emulation_binding<EpochId: Key<$version>>(
+        fn epoch_in_list<EpochId: Key<$version>>(
             epoch_id: &EpochId,
-            bound_epoch_lists: &Table,
+            epoch_lists: &Table,
         ) -> Result<bool, $err> {
             let serialized = $ser(epoch_id)?;
-            for value in bound_epoch_lists.values() {
-                let bound_epochs: Vec<Vec<u8>> = $de(value)?;
-                if bound_epochs.contains(&serialized) {
+            for value in epoch_lists.values() {
+                let epoch_ids: Vec<Vec<u8>> = $de(value)?;
+                if epoch_ids.contains(&serialized) {
                     return Ok(true);
                 }
             }
